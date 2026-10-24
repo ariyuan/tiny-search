@@ -1,0 +1,8 @@
+* text=auto
+
+# Batch files must keep CRLF: cmd.exe mishandles LF-only files (goto/labels break).
+*.bat text eol=crlf
+
+# Source files stay LF for diff friendliness.
+*.py  text eol=lf
+*.md  text eol=lf

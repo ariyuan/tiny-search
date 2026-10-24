@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artefacts
+*.log
+*.tmp
+build/
+dist/
+
+# Local index cache (derived data, never committed)
+index/
+cache/
+*.idx
+
+# Specs and development-process files (not published)
+specs/
+.specify/
+tests/
+.codebuddy/
+scripts/
+CODEBUDDY.md
+
+# Local AI assistant workspace
+.workbuddy/
