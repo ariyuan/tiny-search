@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""index_cache.py — index persistence and incremental warm start.
+"""index_cache.py — index persistence and incremental warm start (service facade).
 
-Architecture:
+018 架构重构后的角色：本文件是缓存服务的**门面 + 编排层**。存储、位置策略、增量
+diff 已拆入 `mft/cache/`（store / location / diff），遍历内核在 `mft/index/
+walk_source.py`；留在这里的是编排——build_index_cached 的冷启 / 温启 / 无缓存
+三分支与后台写线程，原因是这些函数的调用点必须在**本模块命名空间**解析：
+测试打桩 `ic.is_cacheable` / `ic.build_walk_index` / `ic.walk_with_dirs` 后跑
+build_index_cached，走的就是打桩函数（t007）。
+
+公开名称与原模块逐一对应（IndexCache / cache_db_path / is_cacheable / _discard /
+build_walk_index / scan_dir / walk_with_dirs …），老调用方与测试零感知。
+
+Architecture (moved into mft/cache/, behaviour unchanged):
   - Storage: SQLite (stdlib), one row per directory (path, seq, mtime, names_blob).
-    names_blob = a zlib-compressed list of basenames (files + junctions, same semantics as
-    build_walk_index). Measured: 286,190 paths -> 3.8 MB of compressed blocks, ~8 MB
+    names_blob = a zlib-compressed list of basenames (files + junctions, same semantics
+    as build_walk_index). Measured: 286,190 paths -> 3.8 MB of compressed blocks, ~8 MB
     including 40k directory paths (row-per-file storage would need 73 MB).
   - Warm start: load all rows -> stat each directory and compare mtime -> rescan only the
     changed directories (recursively expanding newly discovered subdirectories) -> merge.
@@ -18,227 +28,52 @@ Architecture:
     and never crash.
 """
 
-import hashlib
 import os
 import sqlite3
 import sys
 import threading
 import time
-import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mft_finder import build_walk_index, scan_dir, walk_with_dirs  # noqa: E402
+from mft.cache.diff import _join_fast, _rescan  # noqa: E402
+from mft.cache.location import (_discard, _ensure_cache_dir, cache_db_path,  # noqa: E402
+                                is_cacheable)
+from mft.cache.store import (BUSY_TIMEOUT_MS, SCHEMA_VERSION, IndexCache,  # noqa: E402
+                             compress_names, decompress_names)
+from mft.index.walk_source import build_walk_index, scan_dir, walk_with_dirs  # noqa: E402
 
-SCHEMA_VERSION = "1"
-BUSY_TIMEOUT_MS = 1000
-DRIVE_FIXED = 3
-
-# ---------------------------------------------------------------- volume detection
-
-
-def _volume_info(path: str):
-    """(drive_type, fs_name). Returns (None, None) for UNC paths and errors."""
-    import ctypes
-    from ctypes import wintypes
-
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
-    k32.GetDriveTypeW.restype = wintypes.UINT
-    k32.GetVolumeInformationW.argtypes = [
-        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
-    ]
-    k32.GetVolumeInformationW.restype = wintypes.BOOL
-
-    root = os.path.splitdrive(os.path.abspath(path))[0]
-    if not root:
-        return None, None
-    drive = root + "\\"
-    dtype = k32.GetDriveTypeW(drive)
-    fs = ctypes.create_unicode_buffer(32)
-    ok = k32.GetVolumeInformationW(drive, None, 0, None, None, None, fs, 32)
-    return dtype, (fs.value if ok else None)
-
-
-def is_cacheable(root: str) -> bool:
-    """Cache only fixed local NTFS volumes: mtime semantics are unreliable on network
-    shares, removable drives and FAT32."""
-    try:
-        dtype, fs = _volume_info(root)
-    except OSError:
-        return False
-    return dtype == DRIVE_FIXED and (fs or "").upper() == "NTFS"
-
-
-# ---------------------------------------------------------------- cache file location
-
-
-def cache_db_path(root: str, skip_appdata: bool, cache_dir: str = None) -> Path:
-    """<cache_dir or project>/cache/index-<sha1(root|rules)[:12]>.db."""
-    key = "%s|%s" % (os.path.abspath(root), "lean" if skip_appdata else "full")
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    base = Path(cache_dir) if cache_dir else (
-        Path(__file__).resolve().parent.parent / "cache")
-    return base / ("index-%s.db" % digest)
-
-
-def _ensure_cache_dir(db_path: Path) -> bool:
-    """Make sure the cache directory exists; returns False when it is read-only (no cache)."""
-    try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        return True
-    except OSError:
-        return False
-
-
-# ---------------------------------------------------------------- compression
-
-
-def compress_names(names) -> bytes:
-    """List of basenames -> zlib blob (level 6: 286k paths take 0.59 s -> 3.8 MB)."""
-    return zlib.compress("\n".join(names).encode("utf-8"), 6)
-
-
-def decompress_names(blob: bytes):
-    """zlib blob -> list of basenames. Empty directory -> [].
-
-    Note that `"".split("\\n") == ['']`, so the empty string needs a special case —
-    otherwise an empty directory yields one ghost entry named "" (which becomes "dir\\"
-    after joining) and a warm start invents files out of nowhere.
-    """
-    if not blob:
-        return []
-    text = zlib.decompress(blob).decode("utf-8")
-    return text.split("\n") if text else []
-
-
-# ---------------------------------------------------------------- IndexCache
-
-
-class IndexCache:
-    """Thin wrapper around one cache db. The connection belongs to the creating thread and
-    is never shared across threads."""
-
-    def __init__(self, db_path: Path):
-        self.path = db_path
-        self.con = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000.0)
-        try:
-            self.con.execute("PRAGMA journal_mode=OFF")
-            self.con.execute("PRAGMA synchronous=OFF")
-        except sqlite3.Error:
-            # A garbage file blows up during connect (journal_mode reads the db header).
-            # At that point self.con exists but the constructor never finished, so the
-            # caller has no object to close — clean up here, otherwise the handle stays
-            # open on Windows and _discard cannot delete the file.
-            self.close()
-            raise
-
-    def healthy(self) -> bool:
-        """quick_check liveness probe; garbage or half-written files always count as corrupt."""
-        try:
-            row = self.con.execute("PRAGMA quick_check(1)").fetchone()
-            return bool(row) and row[0] == "ok"
-        except sqlite3.DatabaseError:
-            return False
-
-    def ensure_schema(self):
-        self.con.execute(
-            "CREATE TABLE IF NOT EXISTS dirs ("
-            " path TEXT PRIMARY KEY, seq INTEGER NOT NULL,"
-            " mtime REAL NOT NULL, names BLOB NOT NULL) WITHOUT ROWID")
-        self.con.execute(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-
-    def read_meta(self) -> dict:
-        try:
-            return dict(self.con.execute("SELECT key, value FROM meta").fetchall())
-        except sqlite3.DatabaseError:
-            return {}
-
-    def load_rows(self):
-        """[(path, seq, mtime, names_blob)] ordered by seq (= DFS visit order of the cold build)."""
-        return self.con.execute(
-            "SELECT path, seq, mtime, names FROM dirs ORDER BY seq").fetchall()
-
-    def upsert_dir(self, path: str, seq: int, mtime: float, names_blob: bytes):
-        self.con.execute(
-            "INSERT OR REPLACE INTO dirs (path, seq, mtime, names) VALUES (?,?,?,?)",
-            (path, seq, mtime, names_blob))
-
-    def delete_dirs(self, paths):
-        self.con.executemany("DELETE FROM dirs WHERE path=?", [(p,) for p in paths])
-
-    def replace_all(self, rows):
-        """Full replacement in a single transaction. The caller wraps this in `with`.
-        rows = [(path, seq, mtime, blob)]."""
-        self.con.execute("DELETE FROM dirs")
-        self.con.executemany(
-            "INSERT INTO dirs (path, seq, mtime, names) VALUES (?,?,?,?)", rows)
-
-    def write_meta(self, meta: dict):
-        self.con.executemany(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
-            [(k, str(v)) for k, v in meta.items()])
-
-    def commit(self):
-        self.con.commit()
-
-    def close(self):
-        try:
-            self.con.close()
-        except sqlite3.Error:
-            pass
-
-
-# ---------------------------------------------------------------- diff details
-
-
-def _rescan(path: str, known: dict, skip_appdata_child: bool = False):
-    """Rescan one directory. Returns (names, new_rows):
-
-    - names    the current files + junction names of this directory (same semantics as scan_dir)
-    - new_rows [(subdir, mtime, names)] covering only subdirectories that are not in the
-               cache yet, each scanned recursively (handles a new subtree created while the
-               tool was offline). Known subdirectories keep their old row; their own mtime
-               decides whether they get rescanned, so no work is duplicated.
-    """
-    names, subdirs = scan_dir(path)
-    if skip_appdata_child:
-        subdirs = [s for s in subdirs if os.path.basename(s).lower() != "appdata"]
-    new_rows = []
-    for s in subdirs:
-        if s in known:
-            continue
-        sub_names, sub_rows = _rescan(s, known)
-        try:
-            m = os.stat(s).st_mtime
-        except OSError:
-            continue
-        new_rows.append((s, m, sub_names))
-        new_rows.extend(sub_rows)
-    return names, new_rows
+__all__ = [
+    "BUSY_TIMEOUT_MS", "IndexCache", "SCHEMA_VERSION", "build_index_cached",
+    "build_walk_index", "cache_db_path", "compress_names", "decompress_names",
+    "is_cacheable", "print_cache_line", "scan_dir", "wait_writer", "walk_with_dirs",
+]
 
 
 # ---------------------------------------------------------------- public entry points
 
-
 def build_index_cached(root: str, skip_appdata: bool = False,
-                       cache_dir: str = None, background: bool = True):
+                       cache_dir: str = None, background: bool = True, on_batch=None):
     """Unified index entry point: cache first, degrade on failure. The returned list has the
     same semantics as build_walk_index.
 
     Returns (files, stats). stats:
       mode      warm (cache diff) / cold (full rebuild) / nocache (no cache)
       load_ms / diff_ms / rescanned / entries / reason (for nocache)
+
+    on_batch (014): optional progress hook forwarded to the traversal. It receives the live
+    file list (called at most every PROGRESS_INTERVAL seconds) and may raise to abort the
+    build — a cancelled cold build returns nothing and writes no cache, because the exception
+    unwinds before the persist step.
     """
     stats = {"mode": "cold", "load_ms": 0.0, "diff_ms": 0.0,
              "rescanned": 0, "entries": 0, "reason": ""}
 
     def _no_cache(reason: str):
-        files = build_walk_index(root, skip_appdata=skip_appdata)
+        files = build_walk_index(root, skip_appdata=skip_appdata, on_batch=on_batch)
         stats.update(mode="nocache", entries=len(files), reason=reason)
+        if on_batch is not None:
+            on_batch(files)                       # one final publish for the fast paths
         return files, stats
 
     if not is_cacheable(root):
@@ -260,7 +95,7 @@ def build_index_cached(root: str, skip_appdata: bool = False,
     try:
         if not has_cache:
             # Brand-new cache: go straight to a cold build, no warning (the normal first run).
-            return _cold_build(root, skip_appdata, db_path, want_meta, stats, background)
+            return _cold_build(root, skip_appdata, db_path, want_meta, stats, background, on_batch)
         cache = IndexCache(db_path)
         if not cache.healthy():
             raise ValueError("cache file is corrupt")
@@ -271,13 +106,13 @@ def build_index_cached(root: str, skip_appdata: bool = False,
             cache.close()
         _discard(db_path)
         print("[cache] %s, rebuilding from scratch." % exc)
-        return _cold_build(root, skip_appdata, db_path, want_meta, stats, background)
+        return _cold_build(root, skip_appdata, db_path, want_meta, stats, background, on_batch)
 
     try:
-        return _warm_build(root, skip_appdata, cache, stats)
+        return _warm_build(root, skip_appdata, cache, stats, on_batch)
     except sqlite3.Error as exc:
         print("[cache] Warm start failed (%s), rebuilding from scratch." % exc)
-        return _cold_build(root, skip_appdata, db_path, want_meta, stats, background)
+        return _cold_build(root, skip_appdata, db_path, want_meta, stats, background, on_batch)
     finally:
         cache.close()
 
@@ -297,16 +132,7 @@ def print_cache_line(stats: dict, prefix: str = "[cache]"):
         print("%s no cache (%s), full walk this time" % (prefix, stats.get("reason", "")))
 
 
-def _discard(db_path: Path):
-    """Delete an untrusted cache file (reversible: the next run rebuilds it)."""
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            Path(str(db_path) + suffix).unlink()
-        except OSError:
-            pass
-
-
-def _cold_build(root, skip_appdata, db_path, want_meta, stats, background):
+def _cold_build(root, skip_appdata, db_path, want_meta, stats, background, on_batch):
     """Cold start: a single walk returns the file list synchronously; writing happens on a
     background daemon thread.
 
@@ -318,7 +144,7 @@ def _cold_build(root, skip_appdata, db_path, want_meta, stats, background):
     the process exits — otherwise one-shot mode (--list) exits immediately, the daemon thread
     is cut short and the cache is never built.
     """
-    files, dir_rows = walk_with_dirs(root, skip_appdata=skip_appdata)
+    files, dir_rows = walk_with_dirs(root, skip_appdata=skip_appdata, on_batch=on_batch)
     stats.update(mode="cold", entries=len(files))
     if background:
         t = threading.Thread(target=_persist_rows,
@@ -366,22 +192,7 @@ def _persist_rows(db_path, want_meta, dir_rows):
         print("[cache] Background write failed (%s), the next start will rebuild." % exc)
 
 
-def _join_fast(d: str, n: str) -> str:
-    """Character-for-character identical to os.path.join(d, n) for a bare file name, but
-    without the split/checks inside join (286k calls add up to ~200 ms, and the warm-start
-    budget is tight).
-
-    Replicates the two special cases of ntpath.join: d already ends with a separator, and
-    d is a bare drive letter ("C:").
-    """
-    if d[-1:] in ("/", "\\"):
-        return d + n
-    if len(d) == 2 and d[1] == ":":
-        return d + n
-    return d + os.sep + n
-
-
-def _warm_build(root, skip_appdata, cache, stats):
+def _warm_build(root, skip_appdata, cache, stats, on_batch=None):
     """Warm start: load -> mtime diff -> rescan changed directories -> merge."""
     stats["mode"] = "warm"
     t0 = time.perf_counter()
@@ -447,4 +258,6 @@ def _warm_build(root, skip_appdata, cache, stats):
         prefix = d if d[-1:] in ("/", "\\") or (len(d) == 2 and d[1] == ":") \
             else d + os.sep
         files.extend([prefix + n for n in ns])
+    if on_batch is not None:
+        on_batch(files)                            # warm start: one publish, no progress
     return files, stats

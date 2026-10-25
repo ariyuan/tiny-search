@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_ui.py — the local web search UI of MFT Search (single file, zero third-party deps by default).
+web_ui.py — the local web search UI of MFT Search (HTTP/window delivery facade).
+
+018 架构重构后的角色：领域逻辑已沉入 `mft/` 包——范围模型在 `mft.scope`、默认页面
+在 `mft.page`、进程 IO 计数器在 `mft.platform.win32`、索引入口在 `mft.index`、
+缓存在 `mft.cache`（经 index_cache 门面）。本文件保留交付层：HTTP 路由与服务端
+状态、索引构建编排、IO 速率计量、参数解析与 main()；pywebview 原生窗口载体在
+`native_window.py`（本文件再导出，patch 面不变）。
+
+这些编排函数留在本层的共同原因是**调用点必须在本模块命名空间解析**：测试打桩
+`web_ui.is_admin` / `web_ui.build_index_cached` / `web_ui.build_mft_index` /
+`web_ui.list_volumes` / `web_ui.process_io_bytes` / `web_ui.io_meter_of` /
+`web_ui.ThreadingHTTPServer` / `web_ui.serve_in_thread` / `web_ui.run_window` 之后
+跑 main() 或直接起 Handler，走的就是打桩函数（t007 / t013 / t016 / t017 / t019）。
+原模块的公开名称（PAGE、scope_*、IoMeter、Handler……）经再导出一个不少。
 
 --window mode is the native-window carrier backed by the optional pywebview dependency:
 when it is missing or the WebView2 runtime is unavailable, the browser is used instead with
@@ -9,7 +22,10 @@ identical behaviour.
 
 A loopback-only web UI wrapped around the CLI prototype (src/mft_finder.py):
   - builds the index once at startup (walk or mft) and keeps it in memory for all queries
-  - opens http://127.0.0.1:8765 : search box + search button + result list
+  - opens http://127.0.0.1:8765 : search box + volume selector + search button + result list
+  - in whole-volume MFT mode (administrator) the selector switches to another fixed NTFS
+    volume: POST /api/switch rebuilds the index and swaps it atomically, GET /api/volumes
+    lists the candidates (013). Other modes show the indexed folder instead and grey it out
   - matches file names only, never reads file contents
   - binds 127.0.0.1 only, the page makes no external requests, no telemetry of any kind
 
@@ -40,222 +56,229 @@ from urllib.parse import parse_qs
 
 # Same directory as this file, imported directly; index and search logic is never duplicated
 from index_cache import build_index_cached, print_cache_line
-from mft_finder import (build_index_verbose, is_admin, materialize_paths,
-                        parse_query, run_search)
+from mft.errors import BuildCancelled
+from mft.index.mft_source import _mft_error_hint, build_mft_index, materialize_paths
+from mft.index.walk_source import is_user_dir
+from mft.iometer import IoMeter as _IoMeter
+from mft.page import PAGE
+from mft.platform.volumes import is_admin, list_volumes, system_drive_root
+from mft.platform.win32 import process_io_bytes
+from mft.query import parse_query, run_search
+from mft.scope import (is_drive_root, normalize_volume, scope_for_root, scope_label,
+                       scope_prefix, volume_scope)
+
+__all__ = [
+    "BuildCancelled", "DEFAULT_PORT", "Handler", "IoMeter", "PAGE", "RESULT_LIMIT",
+    "ThreadingHTTPServer", "build_index_cached", "build_mft_index", "build_state_of",
+    "io_meter_of", "io_state_of", "is_admin", "is_drive_root", "is_user_dir",
+    "list_volumes", "main", "materialize_paths", "normalize_volume", "parse_query",
+    "port_in_use", "print_cache_line", "process_io_bytes", "request_scope", "resolve_scope",
+    "run_search", "run_window", "scope_for_root", "scope_label", "scope_of", "scope_prefix",
+    "serve_in_thread", "stop_server", "system_drive_root", "volume_scope",
+]
 
 RESULT_LIMIT = 200          # same default cap as run_search on the CLI
 DEFAULT_PORT = 8765
 
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>MFT Search</title>
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-         margin: 0; background: #f5f6f8; color: #1a1a1a; }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  #status { font-size: 12px; color: #666; margin-bottom: 16px; }
-  form { display: flex; gap: 8px; }
-  #q { flex: 1; padding: 10px 12px; font-size: 15px;
-       border: 1px solid #c8ccd4; border-radius: 8px; }
-  #q:focus { outline: 2px solid #2563eb66; border-color: #2563eb; }
-  button { padding: 10px 20px; font-size: 15px; border: 0; border-radius: 8px;
-           background: #2563eb; color: #fff; cursor: pointer; }
-  button:hover { background: #1d4ed8; }
-  #meta { font-size: 13px; color: #444; margin: 14px 2px 8px; min-height: 18px; }
-  #meta.hint { color: #b91c1c; }
-  #results { list-style: none; margin: 0; padding: 0; }
-  #results li { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px;
-               padding: 6px 10px; background: #fff; border: 1px solid #e4e7ec;
-               border-radius: 6px; margin-bottom: 6px; word-break: break-all; }
-  /* Keyword highlight. <mark> is created through the DOM API; path data stays plain text. */
-  #results li mark { background: #fde68a; color: #1a1a1a; border-radius: 2px;
-                    padding: 0 1px; }
-  /* Settings dropdown (search scope switch) */
-  .settings { position: relative; }
-  #settings-btn { background: #fff; color: #1a1a1a; border: 1px solid #c8ccd4;
-                  white-space: nowrap; }
-  #settings-btn:hover { background: #eef1f5; }
-  #settings-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 10;
-                   background: #fff; border: 1px solid #e4e7ec; border-radius: 8px;
-                   box-shadow: 0 4px 16px rgba(0,0,0,.12); padding: 10px 12px;
-                   min-width: 150px; }
-  #settings-menu[hidden] { display: none; }
-  .settings-title { font-size: 12px; color: #666; margin: 0 0 6px; }
-  #settings-menu label { display: flex; align-items: center; gap: 6px;
-                         font-size: 13px; padding: 4px 0; cursor: pointer; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>MFT Search</h1>
-  <div id="status">Loading index status...</div>
-  <form id="form">
-    <input id="q" type="text" placeholder="Search file names (space = AND, ! = exclude)"
-           autocomplete="off" autofocus>
-    <button type="submit">Search</button>
-    <div class="settings">
-      <button type="button" id="settings-btn">Settings</button>
-      <div id="settings-menu" hidden>
-        <div class="settings-title">Search scope</div>
-        <label><input type="radio" name="scope" value="filename"> File name only</label>
-        <label><input type="radio" name="scope" value="path"> Full path</label>
-      </div>
-    </div>
-  </form>
-  <div id="meta"></div>
-  <ul id="results"></ul>
-</div>
-<script>
-var form = document.getElementById('form');
-var q = document.getElementById('q');
-var meta = document.getElementById('meta');
-var results = document.getElementById('results');
-var settingsBtn = document.getElementById('settings-btn');
-var settingsMenu = document.getElementById('settings-menu');
-var scopeRadios = settingsMenu.querySelectorAll('input[name=scope]');
 
-/* ---------- Search scope (settings dropdown + localStorage persistence) ---------- */
-var SCOPE_KEY = 'mft-search.scope';
-var SCOPE_LABEL = { filename: 'file name', path: 'full path' };
-var scope = 'filename';
-try { scope = localStorage.getItem(SCOPE_KEY) || 'filename'; } catch (e) {}
-if (scope !== 'path') { scope = 'filename'; }   // fallback: anything but 'path' is the default
+# ---------------------------------------------------------------- server state helpers
 
-function syncScopeUI() {
-  for (var i = 0; i < scopeRadios.length; i++) {
-    scopeRadios[i].checked = (scopeRadios[i].value === scope);
-  }
-  q.placeholder = (scope === 'path' ? 'Search full paths' : 'Search file names') +
-                  ' (space = AND, ! = exclude)';
-}
+def _public_stats(stats):
+    """JSON-safe view of the cache stats.
 
-settingsBtn.addEventListener('click', function (e) {
-  e.stopPropagation();
-  settingsMenu.hidden = !settingsMenu.hidden;
-});
-settingsMenu.addEventListener('click', function (e) { e.stopPropagation(); });
-document.addEventListener('click', function () { settingsMenu.hidden = true; });
-document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') { settingsMenu.hidden = true; }
-});
-for (var i = 0; i < scopeRadios.length; i++) {
-  scopeRadios[i].addEventListener('change', function () {
-    scope = this.value;
-    try { localStorage.setItem(SCOPE_KEY, scope); } catch (e) {}
-    syncScopeUI();
-    settingsMenu.hidden = true;
-    if (q.value.trim()) { doSearch(); }   // switching scope re-runs the search immediately
-  });
-}
+    A cold build returns `stats["writer"]` — the handle of the background cache-writing
+    thread, kept so one-shot CLI runs can join it before exiting. A Thread is not
+    serialisable, and json.dumps fails *after* the response headers are on their way, so the
+    client sees a dropped connection and the page stops refreshing. Filtering to scalars
+    keeps /api/status alive no matter what the cache layer adds later.
+    """
+    if not stats:
+        return None
+    return {k: v for k, v in stats.items()
+            if isinstance(v, (str, int, float, bool)) or v is None}
 
-/* ---------- Keyword highlight (DOM API assembly, never innerHTML) ---------- */
-/* Note: PAGE is a plain triple-quoted string, so backslashes in the regex are escaped
-   again for the Python literal. */
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
-}
 
-function highlight(text, terms) {
-  var frag = document.createDocumentFragment();
-  if (!terms || terms.length === 0) {
-    frag.appendChild(document.createTextNode(text));
-    return frag;
-  }
-  var re = new RegExp('(' + terms.map(escapeRegExp).join('|') + ')', 'gi');
-  var last = 0, m;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) {
-      frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-    }
-    var mark = document.createElement('mark');
-    mark.textContent = m[0];               // textContent: path data never reaches the HTML parser
-    frag.appendChild(mark);
-    last = m.index + m[0].length;
-    if (m[0].length === 0) { re.lastIndex++; }   // guard against zero-length matches looping forever
-  }
-  if (last < text.length) {
-    frag.appendChild(document.createTextNode(text.slice(last)));
-  }
-  return frag;
-}
+def build_state_of(httpd) -> dict:
+    """The build state dict, created on demand: tests and embeddings that only inject
+    index_store/index_meta keep working."""
+    state = getattr(httpd, "build_state", None)
+    if state is None:
+        state = {"building": False, "progress": 0, "error": "", "note": "", "started": 0.0}
+        httpd.build_state = state
+    return state
 
-/* ---------- Search ---------- */
-function doSearch() {
-  var query = q.value.trim();
-  if (!query) {
-    meta.textContent = 'Please enter a keyword';
-    meta.className = 'hint';
-    results.replaceChildren();
-    return;
-  }
-  meta.textContent = 'Searching...';
-  meta.className = '';
-  fetch('/api/search?q=' + encodeURIComponent(query) + '&scope=' + scope)
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      if (d.error) {
-        meta.textContent = d.error;
-        meta.className = 'hint';
-        results.replaceChildren();
-        return;
-      }
-      var extra = d.count >= d.limit ? ' (limit ' + d.limit + ' reached, showing the first '
-                                        + d.limit + ')' : '';
-      meta.textContent = d.count + ' hits · ' + d.ms.toFixed(1) + ' ms · scope: ' +
-        (SCOPE_LABEL[d.scope] || d.scope) + extra;
-      meta.className = '';
-      var frag = document.createDocumentFragment();
-      for (var i = 0; i < d.results.length; i++) {
-        var li = document.createElement('li');
-        li.appendChild(highlight(d.results[i], d.terms));   // highlight + textContent, belt and braces
-        frag.appendChild(li);
-      }
-      results.replaceChildren(frag);
-    })
-    .catch(function (err) {
-      meta.textContent = 'Request failed: ' + err;
-      meta.className = 'hint';
-    });
-}
 
-form.addEventListener('submit', function (e) {
-  e.preventDefault();
-  doSearch();
-});
+def scope_of(httpd) -> dict:
+    """The indexed scope; derived from index_meta when it was never set explicitly."""
+    scope = getattr(httpd, "index_scope", None)
+    if scope:
+        return scope
+    mode, root = httpd.index_meta[0], httpd.index_meta[1]
+    return volume_scope(root) if mode == "mft" else scope_for_root(root)
 
-fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
-  var cacheTxt = '';
-  if (s.cache && s.cache.mode === 'warm') {
-    cacheTxt = ' · cache warm start (' + s.cache.rescanned + ' directories rescanned)';
-  } else if (s.cache && s.cache.mode === 'cold') {
-    cacheTxt = ' · cache cold start (writing in the background)';
-  } else if (s.cache && s.cache.mode === 'nocache') {
-    cacheTxt = ' · cache disabled';
-  }
-  document.getElementById('status').textContent =
-    'Index: ' + s.entries.toLocaleString() + ' entries · ' + s.mode +
-    ' mode · built in ' + (s.build_ms / 1000).toFixed(2) + ' s' + cacheTxt +
-    ' · scope: ' + SCOPE_LABEL[scope];
-}).catch(function () {
-  document.getElementById('status').textContent = 'Could not load index status';
-});
 
-syncScopeUI();
-</script>
-</body>
-</html>
-"""
+# ---------------------------------------------------------------- disk I/O meter (017)
+
+class IoMeter(_IoMeter):
+    """Facade adapter over mft.iometer.IoMeter (018).
+
+    The rate logic itself lives in mft.iometer.IoMeter; what stays here is the
+    counter *binding*: sample() must resolve process_io_bytes through *this*
+    module's namespace — that is the seam t019 patches (web_ui.process_io_bytes
+    = fake, then web_ui.IoMeter(interval=1.0).sample()). The lambda captures no
+    value at construction time, so the patched global is what gets called.
+    """
+
+    def __init__(self, interval: float = 1.0):
+        super().__init__(interval, sampler=lambda: process_io_bytes())
+
+
+def io_meter_of(httpd) -> IoMeter:
+    """The per-server I/O meter, created on first use (tests and embeddings included)."""
+    meter = getattr(httpd, "io_meter", None)
+    if meter is None:
+        meter = IoMeter()
+        httpd.io_meter = meter
+        meter.start()
+    return meter
+
+
+def io_state_of(httpd):
+    """JSON-safe I/O view for /api/status: MB/s rates (1 MiB = 1048576 B) plus the
+    session totals. Any failure degrades to None so one broken field can never take
+    the whole status response down (the _public_stats defence, 016's lesson)."""
+    try:
+        return io_meter_of(httpd).snapshot()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- index builds (014)
+
+def _publish(httpd, store, mode, root, scope, build_ms, cache_stats, note=""):
+    """Swap in a finished index.
+
+    The dead path table is cleared *before* the store is replaced so no request can pair the
+    new index with the previous volume's paths (016 asserts this).
+    """
+    httpd.mft_paths = None
+    httpd.mft_paths_cache = None
+    httpd.index_store = (store, scope_prefix(scope, root))
+    httpd.index_scope = scope
+    httpd.index_meta = (mode, root, len(store), build_ms, False)
+    httpd.index_cache = _public_stats(cache_stats) or {"mode": "mft"}
+    httpd.build_state.update(building=False, progress=len(store), error="", started=0.0)
+    if note:
+        httpd.build_state["note"] = note
+
+
+def _walk_worker(httpd, scope, gen):
+    """Background walk: publishes the growing list as it goes, so searching works from the
+    first second even on a 1.7M-entry system drive."""
+    root = scope["root"]
+    state = httpd.build_state
+
+    def on_batch(files):
+        if httpd.build_gen != gen:
+            raise BuildCancelled()      # a newer scope request won, drop this build
+        state["progress"] = len(files)
+        httpd.index_store = (files, scope_prefix(scope, root))   # live list, no copy
+
+    t0 = time.perf_counter()
+    try:
+        store, stats = build_index_cached(root, skip_appdata=is_user_dir(root),
+                                          on_batch=on_batch)
+    except BuildCancelled:
+        sys.stderr.write("[build] cancelled: %s\n" % scope_label(scope))
+        return
+    except Exception as exc:            # never let a walk failure kill the server
+        state["building"] = False
+        state["error"] = "%s: %s" % (type(exc).__name__, exc)
+        sys.stderr.write("[build] failed: %s (%s)\n" % (scope_label(scope), exc))
+        return
+    if httpd.build_gen != gen:
+        return
+    ms = (time.perf_counter() - t0) * 1000
+    _publish(httpd, store, "walk", root, scope, ms, stats)
+    sys.stderr.write("[build] %s: %s entries in %.1f s (%s)\n"
+                     % (scope_label(scope), format(len(store), ","), ms / 1000,
+                        stats.get("mode")))
+    print_cache_line(stats)
+
+
+def request_scope(httpd, scope, prefer_mft=True, force=False):
+    """Index `scope` now. Returns (mode, cancelled_previous).
+
+    Whole volumes try $MFT first (seconds) and fall back to a background walk; folders are
+    always walked ($MFT is a whole-volume enumeration). Any in-flight build is cancelled by
+    bumping the generation, which the old build observes at its next progress callback.
+    """
+    with httpd.build_lock:
+        state_now = build_state_of(httpd)
+        cancelled = bool(state_now.get("building"))
+        if not force and not cancelled and scope_of(httpd) == scope:
+            # Same scope: never burn a rebuild for a no-op selection (013 FR-006).
+            return "unchanged", False
+        httpd.build_gen += 1
+        gen = httpd.build_gen
+        state = build_state_of(httpd)
+        state.update(building=True, progress=0, error="", note="", started=time.time())
+        root = scope["root"]
+        prefix = scope_prefix(scope, root)
+
+        if prefer_mft and scope["kind"] == "volume" and is_admin():
+            info = {v["letter"]: v for v in list_volumes()}.get(scope["target"])
+            if info and info["selectable"]:
+                print("[*] Reading $MFT of %s: ..." % scope["target"])
+                t0 = time.perf_counter()
+                try:
+                    store = build_mft_index(scope["target"])
+                except OSError as exc:
+                    # Same wording as 007's build_index_verbose: cause + action, on stdout so
+                    # a console user sees it, plus a short note that the page shows.
+                    print("[!] Could not read $MFT of %s: (%s)" % (scope["target"], exc))
+                    print("    Probable cause: %s" % _mft_error_hint(exc))
+                    print("    Switched to permission-free mode automatically: indexing %s, "
+                          "search still works." % root)
+                    note = ("MFT unavailable for %s:, walking instead (%s)"
+                            % (scope["target"], _mft_error_hint(exc).split(".")[0]))
+                    state["note"] = note
+                    httpd.index_store = ([], prefix)
+                    httpd.index_scope = scope
+                    httpd.index_meta = ("walk", root, 0, 0.0, False)
+                    httpd.index_cache = None      # the old build's cold/warm label no longer applies
+                    _spawn_walk(httpd, scope, gen)
+                    return "pending", cancelled
+                ms = (time.perf_counter() - t0) * 1000
+                _publish(httpd, store, "mft", scope["target"], scope, ms, {"mode": "mft"})
+                sys.stderr.write("[build] %s: %s entries in %.1f s (mft)\n"
+                                 % (scope_label(scope), format(len(store), ","), ms / 1000))
+                return "mft", cancelled
+
+        # Walk path: publish an empty store immediately so the page's status is truthful
+        # (nothing from the previous scope may leak into the new one).
+        httpd.index_store = ([], prefix)
+        httpd.index_scope = scope
+        httpd.index_meta = ("walk", root, 0, 0.0, is_user_dir(root))
+        httpd.index_cache = None      # the previous build's cold/warm label no longer applies
+        httpd.mft_paths = None
+        httpd.mft_paths_cache = None
+        _spawn_walk(httpd, scope, gen)
+        return "pending", cancelled
+
+
+def _spawn_walk(httpd, scope, gen):
+    t = threading.Thread(target=_walk_worker, args=(httpd, scope, gen), daemon=True)
+    t.start()
+    return t
 
 
 class Handler(BaseHTTPRequestHandler):
-    """Read-only: / (the page), /api/search and /api/status. The index is injected by the
-    server instance."""
+    """Read-only / (the page), /api/search, /api/status, /api/volumes, plus the single
+    state-changing route /api/switch (reindex another fixed NTFS volume). The index is
+    injected by the server instance."""
 
-    server_version = "MFTSearch/0.3"
+    server_version = "MFTSearch/0.4"
     protocol_version = "HTTP/1.1"
 
     # ---- response helpers -----------------------------------------------
@@ -280,6 +303,29 @@ class Handler(BaseHTTPRequestHandler):
             self._api_search()
         elif path == "/api/status":
             self._api_status()
+        elif path == "/api/volumes":
+            self._api_volumes()
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        """The only state-changing route is /api/switch (rebuild the index for another
+        volume). Everything else stays read-only, so unknown POSTs are rejected."""
+        path = self.path.split("?", 1)[0]
+        # Drain the body first: HTTP/1.1 keep-alive would otherwise desynchronise the next
+        # request on this connection if a caller ever sends one.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 0:
+                self.rfile.read(min(length, 1 << 20))
+        except (TypeError, ValueError):
+            pass
+        if path == "/api/switch":
+            self._api_switch()
+        elif path == "/api/scope":
+            self._api_scope()
+        elif path in ("/", "/api/search", "/api/status", "/api/volumes"):
+            self._send_json({"error": "method not allowed"}, 405)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -306,7 +352,10 @@ class Handler(BaseHTTPRequestHandler):
         must, _deny = parse_query(query)
         self._send_json({"results": results, "count": len(results),
                          "ms": ms, "limit": RESULT_LIMIT,
-                         "scope": scope, "terms": must})
+                         "scope": scope, "terms": must,
+                         # True while a walk is still growing: the page must say so rather
+                         # than let a partial index look like the whole truth (014).
+                         "partial": bool(build_state_of(self.server).get("building"))})
 
     def _mft_paths(self, store, volume):
         """The full-path resolution table for a dict index; built lazily on the first
@@ -315,22 +364,116 @@ class Handler(BaseHTTPRequestHandler):
         Users who only search file names (the default scope) never pay for it; those who
         switch to full path pay one build on their first query (seconds for a million
         entries) and are then on par with a walk store.
+
+        The cache is bound to the *store object* it was built from, not to the server: FRNs
+        are only unique inside one volume, so after a volume switch (013) a table built from
+        the old index would silently return "C:\\..." paths for D: records. An identity check
+        makes reuse impossible across switches without any locking or invalidation ordering.
         """
-        paths = getattr(self.server, "mft_paths", None)
-        if paths is None:
-            t0 = time.perf_counter()
-            paths = materialize_paths(store, volume)
-            self.server.mft_paths = paths
-            sys.stderr.write("[mft] Full-path table built: %s entries in %.2f s "
-                             "(reused by later full-path queries)\n"
-                             % (format(len(paths), ","), time.perf_counter() - t0))
+        cache = getattr(self.server, "mft_paths_cache", None)
+        if cache is not None and cache[0] is store:
+            return cache[1]
+        t0 = time.perf_counter()
+        paths = materialize_paths(store, volume)
+        self.server.mft_paths = paths              # kept for introspection / older tests
+        self.server.mft_paths_cache = (store, paths)
+        sys.stderr.write("[mft] Full-path table built: %s entries in %.2f s "
+                         "(reused by later full-path queries)\n"
+                         % (format(len(paths), ","), time.perf_counter() - t0))
         return paths
 
     def _api_status(self):
-        mode, root, entries, build_ms, skip_appdata = self.server.index_meta
-        self._send_json({"mode": mode, "root": root, "entries": entries,
-                         "build_ms": build_ms, "skip_appdata": skip_appdata,
-                         "cache": getattr(self.server, "index_cache", None)})
+        mode, root, _entries, build_ms, skip_appdata = self.server.index_meta
+        state = build_state_of(self.server)
+        store = self.server.index_store[0]
+        building = bool(state.get("building"))
+        self._send_json({
+            "mode": mode, "root": root,
+            "entries": len(store),                 # live: grows while a walk is running
+            "build_ms": build_ms, "skip_appdata": skip_appdata,
+            "cache": _public_stats(getattr(self.server, "index_cache", None)),
+            "scope": scope_of(self.server),
+            "building": building,
+            "progress": len(store),
+            "building_ms": round((time.time() - state["started"]) * 1000, 1) if building else 0.0,
+            "error": state.get("error", ""),
+            "note": state.get("note", ""),
+            # Live disk I/O of this process (017): MB/s rates plus session totals;
+            # null when the counters are unavailable — never breaks the response.
+            "io": io_state_of(self.server),
+        })
+
+    def _api_volumes(self):
+        """Which fixed volumes this session can index, and how.
+
+        Since 014 every fixed volume is switchable: with administrator rights the NTFS ones
+        go through $MFT, everything else (and every volume without admin rights) is walked.
+        The selector is therefore never disabled; `note` explains the degraded quality.
+        """
+        mode = self.server.index_meta[0]
+        scope = scope_of(self.server)
+        admin = is_admin()
+        note = ""
+        if not admin:
+            note = ("Not running as administrator: drives are indexed by walking (slower, and "
+                    "protected folders are skipped). Run as administrator for the $MFT index.")
+        vols = []
+        for v in list_volumes():
+            item = dict(v)
+            item["walkable"] = True                 # any fixed volume can be traversed
+            item["current"] = (scope.get("kind") == "volume"
+                               and scope.get("target") == v["letter"])
+            vols.append(item)
+        self._send_json({"volumes": vols, "scope": scope, "mode": mode,
+                         "admin": admin, "can_switch": True, "note": note,
+                         "entries": len(self.server.index_store[0])})
+
+    def _api_scope(self):
+        """Change what is indexed: a whole drive or one folder (014).
+
+        `root` may be a drive ('D', 'D:////', 'D:/') or a directory path; a drive root becomes
+        a volume scope, everything else a folder scope. Nothing is swapped on a bad path.
+        """
+        qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        raw = (qs.get("root") or qs.get("volume") or [""])[0].strip()
+        if not raw:
+            self._send_json({"error": "root is required (a drive letter or a folder path)"}, 400)
+            return
+        try:
+            scope = scope_for_root(raw)
+        except (OSError, ValueError) as exc:
+            self._send_json({"error": "cannot use %r: %s" % (raw, exc)}, 400)
+            return
+        if scope["kind"] == "volume":
+            known = {v["letter"] for v in list_volumes()}
+            if scope["target"] not in known:
+                self._send_json({"error": "%s: is not a fixed local volume" % scope["target"],
+                                 "volume": scope["target"]}, 400)
+                return
+        elif not os.path.isdir(scope["target"]):
+            self._send_json({"error": "not an existing folder: %s" % scope["target"]}, 400)
+            return
+
+        mode, cancelled = request_scope(self.server, scope)
+        body = {"scope": scope, "mode": mode, "changed": mode != "unchanged",
+                "cancelled_previous": cancelled,
+                "entries": len(self.server.index_store[0]),
+                "build_ms": self.server.index_meta[3]}
+        if scope["kind"] == "volume":
+            body["volume"] = scope["target"]
+        self._send_json(body, 200)
+
+    def _api_switch(self):
+        """013 compatibility: switch to the whole of a volume. A thin alias for /api/scope."""
+        qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        raw = (qs.get("volume") or [""])[0]
+        volume = normalize_volume(raw)
+        if volume is None:
+            self._send_json({"error": "volume must be a single drive letter (A-Z), got %r"
+                                      % raw}, 400)
+            return
+        self.path = "/api/scope?root=" + volume          # reuse the one validated code path
+        self._api_scope()
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[http] %s\n" % (fmt % args))
@@ -342,95 +485,53 @@ def port_in_use(port: int) -> bool:
     Relying on bind() raising OSError is not enough: Windows SO_REUSEADDR (which socketserver
     enables by default) lets two sockets bind the same port and LISTEN at the same time, so a
     second instance would "succeed silently" and then steal new connections — exactly the
-    silent failure this avoids. Probing with connect first is the most reliable check (this
-    is a single-user local tool, the race between probe and bind is negligible).
+    silent failure this avoids. Probing with connect first is the most reliable check (this is
+    a single-user local tool, the race between probe and bind is negligible).
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def resolve_mode(args) -> tuple:
-    """Return (mode, target). --mft without admin rights degrades to walk and says so;
-    no UAC prompt is ever raised."""
+def resolve_scope(args) -> dict:
+    """Where to index (014). The default is the whole system drive, in every mode.
+
+    - `--mft <letter>`: that whole volume, $MFT first (walk as the fallback)
+    - `--walk <dir>`: that folder
+    - nothing: the whole system drive
+
+    `--mft` without administrator rights is not an error: it degrades to walking the same
+    volume and says why. 009 still holds — no UAC prompt is ever raised here.
+    """
     if args.mft:
-        volume = args.mft.rstrip(":")
-        if not is_admin():
-            print("[!] No administrator rights, cannot read $MFT of %s:." % volume)
-            print("    Switched to permission-free mode: indexing the user directory %s ."
-                  % os.path.expanduser("~"))
-            print("    For whole-volume mode, right-click launch.bat and choose "
+        letter = normalize_volume(args.mft)
+        if letter is None:
+            print("[!] --mft expects a drive letter (e.g. --mft D), got %r; "
+                  "using the system drive." % args.mft)
+        elif not is_admin():
+            print("[!] No administrator rights, cannot read $MFT of %s:." % letter)
+            print("    Permission-free whole-drive mode: indexing %s instead."
+                  % (letter + ":\\"))
+            print("    For the $MFT index, right-click launch.bat and choose "
                   "\"Run as administrator\" (the tool never raises a UAC prompt).")
-            return "walk", os.path.expanduser("~")
-        return "mft", volume
+            # 014 FR-010: the requested volume still gets indexed, just by walking it. Falling
+            # through to the system drive here would index a different drive than the one the
+            # message above promises.
+            return volume_scope(letter)
+        else:
+            return volume_scope(letter)
     if args.walk:
-        return "walk", args.walk
-    return "walk", os.path.expanduser("~")
+        return scope_for_root(args.walk)
+    return scope_for_root(system_drive_root())
 
 
 # ---------------------------------------------------------------- native window
-
-def serve_in_thread(httpd) -> threading.Thread:
-    """Move serve_forever onto a daemon thread so the main thread is free for the GUI loop.
-
-    Windows WebView2 requires the GUI message loop on the main thread (STA), so the HTTP
-    service has to step aside. ThreadingHTTPServer is already thread-safe, no extra locking.
-    """
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    return t
-
-
-def stop_server(httpd, thread: threading.Thread) -> None:
-    """Stop the HTTP service and reap the background thread. Shared by window close and Ctrl-C.
-
-    shutdown() must be called from a thread other than serve_forever; when that thread is
-    already gone (never started, or finished) shutdown is skipped — BaseServer.shutdown()
-    waits on the __is_shut_down event and blocks forever on a server that never served.
-    Failures here never raise a second exception: the process is already on its way out and
-    an error would only hide the real exit information.
-    """
-    try:
-        if thread is not None and thread.is_alive():
-            httpd.shutdown()
-    except Exception:
-        pass
-    try:
-        httpd.server_close()
-    except Exception:
-        pass
-    if thread is not None:
-        thread.join(timeout=2.0)
-
-
-def run_window(url: str) -> bool:
-    """pywebview native window mode. Returns True when the window closed normally.
-
-    Optional dependency: webview is imported inside the function, and a missing package
-    returns False so the caller falls back to the existing browser path — the "copy the
-    folder and run" zero-dependency experience is preserved.
-
-    Broad exception handling: pywebview throws different types depending on what is missing
-    (ImportError / WebViewException / OSError are all possible). The goal is "no failure ever
-    crashes the process": report the cause (including the original exception) and fall back.
-    """
-    try:
-        import webview
-    except ImportError:
-        print("[!] pywebview is not installed, cannot use native window mode.")
-        print("    Install it with: pip install pywebview")
-        print("    Falling back to the browser.")
-        return False
-    try:
-        webview.create_window("MFT Search", url, width=960, height=640)
-        webview.start()
-    except Exception as e:
-        print("[!] Native window failed to start (%s)." % e)
-        print("    Probable cause: the Edge WebView2 runtime is missing "
-              "(shipped with Windows 10/11).")
-        print("    Falling back to the browser.")
-        return False
-    return True
+#
+# The pywebview carrier and the server lifecycle it needs live in native_window.py
+# (the only module touching the optional dependency). They are imported here so the
+# facade's patch surface stays intact: main() resolves serve_in_thread / run_window
+# through *this* module's namespace, which is where tests replace them (t013).
+from native_window import run_window, serve_in_thread, stop_server  # noqa: E402
 
 
 def main() -> int:
@@ -464,32 +565,7 @@ def main() -> int:
         print("    Retry with another port: --port %d" % (args.port + 1))
         return 1
 
-    mode, target = resolve_mode(args)
-
-    # Build the index before serving: whenever the page opens, the index is guaranteed ready.
-    fell_back = False
-    cache_stats = None
-    t0 = time.perf_counter()
-    if mode == "mft":
-        print("[*] Reading $MFT of %s: ..." % target)
-        # A failed read (security software blocking the volume FSCTL, ...) must not crash:
-        # report the cause and the suggested action, then degrade to walking the user
-        # directory (with the slim rules).
-        store, mode, target, notes, cache_stats = build_index_verbose(
-            target, os.path.expanduser("~"), skip_appdata=True)
-        fell_back = bool(notes)
-        for line in notes:
-            print(line)
-        if fell_back:
-            print_cache_line(cache_stats)
-    else:
-        lean = " (skipping top-level AppData)" if args.skip_appdata else ""
-        print("[*] Walking %s%s ..." % (target, lean))
-        store, cache_stats = build_index_cached(target, skip_appdata=args.skip_appdata)
-        print_cache_line(cache_stats)
-    build_ms = (time.perf_counter() - t0) * 1000
-    print("[+] Index ready: %s entries in %.2f s"
-          % (format(len(store), ","), build_ms / 1000))
+    scope = resolve_scope(args)
 
     try:
         httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -498,14 +574,29 @@ def main() -> int:
         print("    It may be taken; retry with another port: --port %d" % (args.port + 1))
         return 1
 
-    httpd.index_store = (store, target if mode == "mft"
-                         else (os.path.splitdrive(target)[0][:1] or "C"))
-    # mode reflects the mode actually in effect (walk after a fallback); same for skip_appdata
-    httpd.index_meta = (mode, target, len(store), build_ms,
-                        (args.skip_appdata or fell_back) if mode == "walk" else False)
-    # Cache statistics live in a separate attribute (the 5-tuple above stays untouched) and
-    # are exposed through /api/status.
-    httpd.index_cache = cache_stats or {"mode": "mft"}
+    # Build state exists before the first index request so /api/status is coherent from the
+    # very first request (a walk keeps building while the page is already usable).
+    httpd.index_store = ([], scope_prefix(scope, scope["root"]))
+    httpd.index_scope = scope
+    httpd.index_meta = ("walk", scope["root"], 0, 0.0, False)
+    httpd.index_cache = {"mode": "mft"}
+    httpd.mft_paths = None
+    httpd.mft_paths_cache = None
+    httpd.build_state = {"building": False, "progress": 0, "error": "", "note": "",
+                         "started": 0.0}
+    httpd.build_gen = 0
+    httpd.build_lock = threading.Lock()
+
+    print("[*] Index scope: %s" % scope_label(scope))
+    # --walk is an explicit request for the permission-free path, so it never tries $MFT.
+    mode, _cancelled = request_scope(httpd, scope, prefer_mft=not args.walk,
+                                     force=True)
+    if mode == "mft":
+        print("[+] Index ready: %s entries in %.2f s"
+              % (format(len(httpd.index_store[0]), ","), httpd.index_meta[3] / 1000))
+    else:
+        print("[*] Indexing in the background (no white screen): the page is usable now,")
+        print("    results are marked partial until the walk finishes. Progress: /api/status")
 
     url = "http://127.0.0.1:%d/" % args.port
     print("[*] Server started: %s (loopback only, Ctrl-C to quit)" % url)

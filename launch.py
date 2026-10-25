@@ -4,8 +4,8 @@
 launch.py — one-click launcher for MFT Search.
 
 Usage:
-    python launch.py                            # default: admin reads $MFT for the whole volume;
-                                                #          non-admin walks the user directory (no UAC)
+    python launch.py                            # default: whole system drive in every mode
+                                                #          (admin: $MFT; others: background walk)
     python launch.py --menu                     # interactive menu (five modes)
     python launch.py <dir>                      # start the web UI indexing <dir>
     python launch.py <dir> --port 9000          # port preference (default 8765, auto-avoids busy ports)
@@ -20,7 +20,7 @@ You can also double-click launch.bat in the project root (it locates Python and 
 
 Behaviour:
   - Never requests UAC elevation: admins get the whole-volume $MFT index, everyone else gets
-    a walk of the user directory.
+    a background walk of the whole system drive (the page is usable while it builds).
   - If reading $MFT fails (e.g. blocked by security software) it degrades to walk and says why.
   - Unexpected exceptions are written to logs/crash-<timestamp>.log.
   - The default entry point prefers a native window and falls back to the browser when
@@ -45,7 +45,8 @@ WEB_UI = SRC / "web_ui.py"
 FINDER = SRC / "mft_finder.py"
 
 sys.path.insert(0, str(SRC))
-from mft_finder import is_admin, is_user_dir  # noqa: E402  reuse the library checks, no second copy
+from mft_finder import (is_admin, is_user_dir,  # noqa: E402  reuse the library checks
+                        system_drive_root)
 
 DEFAULT_PORT = 8765
 PORT_SCAN_RANGE = 20
@@ -214,15 +215,15 @@ def run_mft(volume: str, port_pref: int, extra: list, open_browser: bool) -> int
     """Whole-volume MFT entry point (shared by --mft and menu item [4]).
 
     Never elevates on its own: without admin rights it states the limitation and degrades to
-    walking the user directory (same behaviour as web_ui's resolve_mode); with admin rights it
-    goes the MFT route, and if the read is blocked build_index_verbose degrades and explains.
+    walking the same volume (014: whole drive, not the user directory); with admin rights it
+    goes the MFT route, and if the read is blocked the walk fallback explains why.
     """
     if not is_admin():
         print("[!] Administrator privileges not detected, cannot read $MFT of %s:." % volume)
-        print("    Switched to permission-free mode: indexing the user directory %s ."
-              % os.path.expanduser("~"))
+        print("    Switched to permission-free mode: indexing the whole drive %s: (walk)."
+              % volume)
         print("    For whole-volume mode, right-click launch.bat and choose \"Run as administrator\".")
-        return run_web(os.path.expanduser("~"), port_pref, extra, open_browser)
+        return run_web(volume + ":\\", port_pref, extra, open_browser)
     return run_web(None, port_pref, extra, open_browser, mft_volume=volume)
 
 
@@ -233,8 +234,8 @@ def run_default_mft(port_pref: int, extra: list, open_browser: bool,
     Branches on the current privileges and never triggers a UAC prompt:
     - Administrator (the user chose "Run as administrator", or the shell already is one)
       -> read the C: $MFT; if security software blocks it, degrade to walk and explain.
-    - Otherwise -> walk the user directory (slimmed + warm start from the cache), with a
-      three-line notice covering mode, scope, limits and how to get a whole-volume index.
+    - Otherwise -> background walk of the whole system drive (014), with a notice covering
+      mode, scope, first-run cost and how to get the $MFT index.
 
     The default entry point forwards --window: prefer the native window, and let web_ui's
     fallback chain drop to the browser when pywebview is missing (launch.py does not probe
@@ -249,15 +250,16 @@ def run_default_mft(port_pref: int, extra: list, open_browser: bool,
         print("    (For permission-free mode or the CLI, add --menu)")
         return run_web(None, port_pref, web_extra, open_browser, mft_volume="C")
 
+    drive_root = system_drive_root()
     print("[*] Default mode: no administrator privileges, using the permission-free walk "
           "mode (no UAC prompt).")
-    print("    Scope: user directory %s (top-level AppData skipped, machine caches left out);"
-          % os.path.expanduser("~"))
-    print("    Restarts will warm-start from the index cache (~1-2 s).")
-    print("    Limitation: other volumes are not searchable in this mode. For a whole-volume")
-    print("    index, right-click launch.bat and choose \"Run as administrator\" (the tool")
-    print("    never raises a UAC prompt on its own).")
-    return run_web(os.path.expanduser("~"), port_pref, web_extra, open_browser)
+    print("    Scope: whole drive %s (the page is usable while the index builds in the"
+          % drive_root)
+    print("    background; the first cold walk of a full disk takes minutes, later starts")
+    print("    warm-start from the cache).")
+    print("    For the seconds-fast $MFT index, right-click launch.bat and choose")
+    print("    \"Run as administrator\" (the tool never raises a UAC prompt on its own).")
+    return run_web(drive_root, port_pref, web_extra, open_browser)
 
 
 # ---------------------------------------------------------------- crash log

@@ -11,8 +11,10 @@ build/
 dist/
 
 # Local index cache (derived data, never committed)
-index/
-cache/
+# Anchored to the repo root on purpose: src/mft/cache/ and src/mft/index/ are
+# source subpackages and must NOT be excluded by these patterns.
+/index/
+/cache/
 *.idx
 
 # Specs and development-process files (not published)

@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-mft_finder.py — a minimal, teaching-oriented Everything clone (single file, zero dependencies).
+"""mft_finder.py — index & search entry points plus the CLI (compatibility facade).
 
-Two index modes:
+018 架构重构后的角色：实现已按分层拆入 `mft/` 包——platform（Windows 绑定与卷事实）、
+index（$MFT 读取 / 目录遍历）、query（查询）、scope（范围模型）。本文件保留三件事：
+
+  1) **兼容再导出**：原模块的公开名称一个不少（常量、结构体、函数），
+     `from mft_finder import build_walk_index` / `mf.FSCTL_ENUM_USN_DATA` 照旧可用；
+  2) **统一索引入口** build_index / build_index_verbose：$MFT 优先、walk 兜底。
+     留在这层是因为调用点必须在本模块命名空间解析 `build_mft_index`——测试打桩
+     `mf.build_mft_index` 后调 `mf.build_index`，降级文案走的就是打桩函数（t007）；
+  3) **CLI main()**：调用点解析 `is_admin`，并在调用时才 import 缓存服务
+     （t009 打桩 `ic.build_index_cached` 后跑 main 的缝；纯 MFT 路径也不加载缓存层）。
+
+两个索引模式（实现见 mft.index）：
   1) mft mode:  reads the NTFS $MFT directly (FSCTL_ENUM_USN_DATA); hundreds of thousands to
                 millions of files indexed in seconds. Requires administrator rights. This is
                 the real reason Everything is fast. If the read fails (e.g. security software
@@ -23,283 +33,69 @@ Search syntax:
     e.g.  "report 2026 !tmp"
 """
 
-import ctypes
 import os
-import struct
 import sys
 import time
-from ctypes import wintypes
 
-GENERIC_READ = 0x80000000
-FILE_SHARE_ALL = 0x00000007
-OPEN_EXISTING = 3
-FSCTL_ENUM_USN_DATA = 0x00090057
-ERROR_HANDLE_EOF = 38
-INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
-FILE_ATTRIBUTE_DIRECTORY = 0x10
+from mft.errors import BuildCancelled
+from mft.index.mft_source import (MFT_ERROR_HINTS, _mft_error_hint, build_mft_index,
+                                  materialize_paths, path_of)
+from mft.index.walk_source import (build_walk_index as _lib_build_walk_index,
+                                   is_junction, is_user_dir, scan_dir,
+                                   walk_with_dirs as _lib_walk_with_dirs)
+from mft.platform.win32 import (DRIVE_FIXED, ERROR_HANDLE_EOF, FILE_ATTRIBUTE_DIRECTORY,
+                                FILE_SHARE_ALL, FRN_MASK, FSCTL_ENUM_USN_DATA,
+                                GENERIC_READ, INVALID_HANDLE, MFT_ENUM_DATA_V0,
+                                OPEN_EXISTING, ROOT_FRN, USN_RECORD_V2,
+                                USN_RECORD_V2_SIZE, k32)
+from mft.platform.volumes import is_admin, list_volumes, system_drive_root
+from mft.query import parse_query, run_search
 
-# USN_RECORD_V2 has a fixed 60-byte header followed by a UTF-16 file name.
-USN_RECORD_V2 = "<IHHQQqQIIIIHH"
-USN_RECORD_V2_SIZE = 60
-
-k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-k32.CreateFileW.argtypes = [
-    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+__all__ = [
+    "BuildCancelled", "DRIVE_FIXED", "ERROR_HANDLE_EOF", "FILE_ATTRIBUTE_DIRECTORY",
+    "FILE_SHARE_ALL", "FRN_MASK", "FSCTL_ENUM_USN_DATA", "GENERIC_READ", "INVALID_HANDLE",
+    "MFT_ENUM_DATA_V0", "MFT_ERROR_HINTS", "OPEN_EXISTING", "PROGRESS_INTERVAL", "ROOT_FRN",
+    "USN_RECORD_V2", "USN_RECORD_V2_SIZE", "_mft_error_hint", "build_index",
+    "build_index_verbose", "build_mft_index", "build_walk_index", "is_admin", "is_junction",
+    "is_user_dir", "k32", "list_volumes", "main", "materialize_paths", "parse_query",
+    "path_of", "run_search", "scan_dir", "system_drive_root", "walk_with_dirs",
 ]
-k32.CreateFileW.restype = wintypes.HANDLE
-k32.DeviceIoControl.argtypes = [
-    wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-]
-k32.DeviceIoControl.restype = wintypes.BOOL
 
 
-class MFT_ENUM_DATA_V0(ctypes.Structure):
-    _fields_ = [
-        ("StartFileReferenceNumber", ctypes.c_ulonglong),
-        ("LowUsn", ctypes.c_longlong),
-        ("HighUsn", ctypes.c_longlong),
-    ]
+# ---------------------------------------------------------------- walk entry points
+#
+# 遍历内核住在 mft.index.walk_source；这两个入口留在本模块，是为了维持公开面上
+# 的节流旋钮：测试打桩 mft_finder.PROGRESS_INTERVAL 后调用 mft_finder.walk_with_dirs，
+# 看到的就是打桩值（t017 S6 的节流契约）。门面把本模块的值显式传进库层，
+# 库层自身仍是自洽的默认值（interval=None 时读它自己的 PROGRESS_INTERVAL）。
+
+PROGRESS_INTERVAL = 0.5     # seconds between on_batch calls (014)
 
 
-def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------- MFT index
-
-def build_mft_index(volume: str) -> dict:
-    """Return {frn: (parent_frn, name, attrs)}. Names and the directory structure only —
-    file contents are never dereferenced."""
-    path = "\\\\.\\%s:" % volume.rstrip(":")
-    h = k32.CreateFileW(path, GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None)
-    if h == INVALID_HANDLE or h is None:
-        raise OSError(ctypes.get_last_error(),
-                      "cannot open volume %s (usually means no administrator rights)" % path)
-
-    table, buf = {}, ctypes.create_string_buffer(1 << 20)
-    med = MFT_ENUM_DATA_V0(0, 0, 0x7FFFFFFFFFFFFFFF)
-    returned = wintypes.DWORD(0)
-    try:
-        while True:
-            ok = k32.DeviceIoControl(
-                h, FSCTL_ENUM_USN_DATA, ctypes.byref(med), ctypes.sizeof(med),
-                buf, ctypes.sizeof(buf), ctypes.byref(returned), None,
-            )
-            if not ok:
-                if ctypes.get_last_error() == ERROR_HANDLE_EOF:
-                    break
-                raise OSError(ctypes.get_last_error(), "DeviceIoControl failed")
-            n = returned.value
-            if n < 8:
-                break
-            raw = buf.raw
-            med.StartFileReferenceNumber = struct.unpack_from("<Q", raw, 0)[0]
-            off = 8
-            while off + USN_RECORD_V2_SIZE <= n:
-                rec = struct.unpack_from(USN_RECORD_V2, raw, off)
-                rec_len, frn, pfrn, attrs = rec[0], rec[3], rec[4], rec[10]
-                name_len, name_off = rec[11], rec[12]
-                if rec_len <= 0:
-                    break
-                name = raw[off + name_off: off + name_off + name_len].decode("utf-16-le", "replace")
-                table[frn] = (pfrn, name, attrs)
-                off += rec_len
-    finally:
-        k32.CloseHandle(h)
-    return table
-
-
-def path_of(table: dict, frn: int, volume: str) -> str:
-    """Walk the frn -> parent chain and rebuild the path. Only called for hits, so millions
-    of paths are never assembled up front."""
-    parts, seen, cur = [], set(), frn
-    while cur in table and cur not in seen:
-        seen.add(cur)
-        pfrn, name, _ = table[cur]
-        if cur == 5:            # 5 is the fixed FRN of the NTFS root directory
-            parts.append(volume.rstrip(":") + ":")
-            break
-        if name:
-            parts.append(name)
-        if pfrn == cur:
-            break
-        cur = pfrn
-    return "\\".join(reversed(parts))
-
-
-def materialize_paths(store: dict, volume: str) -> dict:
-    """Resolve a dict index into {frn: full path} in one pass (the data source for path search).
-
-    The result is identical to calling path_of on every record, but memoisation turns the
-    O(parent chain depth) walk per record into O(1) amortised work: each directory path is
-    resolved once and each child costs one string concatenation. A million-entry index is
-    done in seconds. Built lazily (and cached) only when the web UI switches to the
-    "full path" scope.
-
-    Broken chains (missing parent record) or cycles (corrupt $MFT) degrade to the same
-    behaviour as path_of: return the partial path resolved so far instead of raising.
-    """
-    resolved = {}
-    for frn in store:
-        if frn in resolved:
-            continue
-        chain, seen = [], set()
-        cur = frn
-        # Collect unresolved ancestors upwards; stop at an already-resolved node,
-        # a broken chain or a cycle.
-        while cur in store and cur not in resolved and cur not in seen:
-            seen.add(cur)
-            chain.append(cur)
-            pfrn = store[cur][0]
-            if pfrn == cur:          # self-reference: finish here, exactly like path_of
-                break
-            cur = pfrn
-        if cur == 5:                 # top of the chain is the NTFS root: same rule as path_of
-            base = volume.rstrip(":") + ":"
-        elif cur in resolved:
-            base = resolved[cur]
-        else:                        # broken chain / cycle: no base, start from the own name
-            base = ""
-        for f in reversed(chain):    # build top-down, one pass
-            if f == 5:
-                resolved[f] = volume.rstrip(":") + ":"
-                base = resolved[f]
-                continue
-            name = store[f][1]
-            base = name if not base else base + "\\" + name
-            resolved[f] = base
-    return resolved
-
-
-# ---------------------------------------------------------------- walk index
-
-def is_junction(entry) -> bool:
-    """Is this DirEntry a junction mount point (IO_REPARSE_TAG_MOUNT_POINT)?
-
-    `is_junction()` is a Python 3.12+ DirEntry method reading the cached scandir attributes,
-    so it costs no extra system call. On older versions it is treated as "not a junction".
-    """
-    fn = getattr(entry, "is_junction", None)
-    return bool(fn()) if fn else False
-
-
-def is_user_dir(path: str) -> bool:
-    """Is path exactly the user directory? (samefile comparison; False on OSError).
-
-    This is the "root == user directory -> skip top-level AppData" rule. It used to live in
-    launch.py (is_profile_root); the CLI degradation path needs the same rule, so it moved
-    into the library — same precedent as is_admin (no third copy).
-    """
-    try:
-        return os.path.samefile(path, os.path.expanduser("~"))
-    except OSError:
-        return False
-
-
-def scan_dir(path: str):
-    """Scan a single directory level. Returns (names, subdirs):
-
-    - names   = names of direct children that are "files + junctions". Junction mount points
-                are not recursed into, only their name is recorded (same semantics as the
-                old build_walk_index).
-    - subdirs = full paths of real subdirectories to recurse into.
-    Raises OSError when the directory itself is unreadable (the caller decides to skip);
-    a failing per-entry check is skipped, as before.
-    """
-    names, subdirs = [], []
-    with os.scandir(path) as it:
-        for e in it:
-            try:
-                if e.is_dir(follow_symlinks=False):
-                    if is_junction(e):
-                        names.append(e.name)
-                    else:
-                        subdirs.append(e.path)
-                else:
-                    names.append(e.name)
-            except OSError:
-                pass
-    return names, subdirs
-
-
-def build_walk_index(root: str, max_files: int = 2_000_000, skip_appdata: bool = False):
+def build_walk_index(root: str, max_files: int = 2_000_000, skip_appdata: bool = False,
+                     on_batch=None):
     """Permission-free fallback index via recursive os.scandir; returns a list of full paths.
 
-    - Junction mount points (e.g. Local Settings / Application Data in the user directory,
-      pointing inside AppData) are not recursed into, their path is only recorded —
-      otherwise the same files would be traversed several times. This is the default.
-    - skip_appdata=True skips the directory named AppData directly under the root (machine-
-      generated cache data; an explicit --walk pointing at AppData itself is unaffected,
-      the root itself is never skipped).
-    - Implemented on top of the scan_dir primitive; the returned list matches the old
-      implementation item for item.
+    Facade entry: forwards this module's PROGRESS_INTERVAL to the traversal kernel.
+    See mft.index.walk_source.build_walk_index for the full contract.
     """
-    files = []
-    stack = [(root, 0)]
-    while stack and len(files) < max_files:
-        d, depth = stack.pop()
-        try:
-            names, subdirs = scan_dir(d)
-        except OSError:
-            continue
-        if depth == 0 and skip_appdata:
-            subdirs = [s for s in subdirs if os.path.basename(s).lower() != "appdata"]
-        files.extend(os.path.join(d, n) for n in names)
-        stack.extend((s, depth + 1) for s in subdirs)
-    return files
+    return _lib_build_walk_index(root, max_files, skip_appdata, on_batch,
+                                 interval=PROGRESS_INTERVAL)
 
 
-def walk_with_dirs(root: str, max_files: int = 2_000_000, skip_appdata: bool = False):
+def walk_with_dirs(root: str, max_files: int = 2_000_000, skip_appdata: bool = False,
+                   on_batch=None):
     """Traverse in the same order as build_walk_index and additionally emit directory rows
-    (the data source for the cache).
+    (the data source for the cache). Returns (files, dir_rows).
 
-    Returns (files, dir_rows):
-    - files    identical to build_walk_index (same order).
-    - dir_rows [(dir_path, mtime, names)] covering every directory in DFS order, empty ones
-      included — an empty directory still needs a cache row so that files added later are
-      detected by the mtime diff.
+    Facade entry: forwards this module's PROGRESS_INTERVAL to the traversal kernel.
+    See mft.index.walk_source.walk_with_dirs for the full contract.
     """
-    files, dir_rows = [], []
-    stack = [(root, 0)]
-    while stack and len(files) < max_files:
-        d, depth = stack.pop()
-        try:
-            names, subdirs = scan_dir(d)
-        except OSError:
-            continue
-        if depth == 0 and skip_appdata:
-            subdirs = [s for s in subdirs if os.path.basename(s).lower() != "appdata"]
-        files.extend(os.path.join(d, n) for n in names)
-        try:
-            dir_rows.append((d, os.stat(d).st_mtime, names))
-        except OSError:
-            pass
-        stack.extend((s, depth + 1) for s in subdirs)
-    return files, dir_rows
+    return _lib_walk_with_dirs(root, max_files, skip_appdata, on_batch,
+                               interval=PROGRESS_INTERVAL)
 
 
 # ---------------------------------------------------------------- unified index entry point
-
-MFT_ERROR_HINTS = {
-    1: ("the filter driver of a security product probably blocked the FSCTL call on the volume "
-        "(ERROR_INVALID_FUNCTION). Disable real-time protection temporarily and retry, or verify "
-        "on another machine; the permission-free walk mode keeps working here."),
-    5: ("insufficient privileges (ERROR_ACCESS_DENIED). Whole-volume mode requires administrator "
-        "rights: run as administrator, or use the permission-free walk mode."),
-}
-
-
-def _mft_error_hint(exc: OSError) -> str:
-    """errno -> a human-readable cause and suggested action. Unknown errno gets a generic
-    message plus the raw error code."""
-    return MFT_ERROR_HINTS.get(
-        exc.errno, "unknown cause (error code %s). Try the permission-free walk mode." % exc.errno)
-
 
 def build_index_verbose(volume: str, walk_root: str, skip_appdata: bool = False,
                         background: bool = True):
@@ -318,9 +114,10 @@ def build_index_verbose(volume: str, walk_root: str, skip_appdata: bool = False,
             "    Switched to permission-free mode automatically: indexing %s, "
             "search still works." % walk_root,
         ]
-        # Deferred import: index_cache depends on this module (build_walk_index etc.), so a
-        # module-level import would be circular. Only the fallback path needs the cache,
-        # which makes a function-local import the natural spot.
+        # Deferred import on purpose (018): the mft_finder <-> index_cache cycle is gone
+        # (the traversal kernel now lives in mft.index.walk_source), but the cache layer is
+        # still resolved at call time — the MFT-only path never loads sqlite, and the CLI
+        # resolves it lazily so tests can stub ic.build_index_cached before main() runs (t009).
         from index_cache import build_index_cached
         files, stats = build_index_cached(walk_root, skip_appdata=skip_appdata,
                                           background=background)
@@ -341,69 +138,7 @@ def build_index(volume: str, walk_root: str, skip_appdata: bool = False):
     return build_index_verbose(volume, walk_root, skip_appdata)[:4]
 
 
-# ---------------------------------------------------------------- search
-
-def parse_query(q: str):
-    must, deny = [], []
-    for t in q.split():
-        if t.startswith("!") and len(t) > 1:
-            deny.append(t[1:].lower())
-        else:
-            must.append(t.lower())
-    return must, deny
-
-
-def run_search(store, query: str, volume: str, limit: int = 200, filename_only: bool = False,
-               paths: dict = None):
-    """With filename_only=True a walk index only matches the basename (a dict index only ever
-    matches record names anyway).
-
-    Default False: list stores match the full path, dict stores match record names. The
-    parameter exists for the "search file names only" option of the web UI.
-
-    paths: the {frn: full path} table for dict stores (the output of materialize_paths).
-    When given and filename_only=False, dict mode matches the full path, just like a list
-    store; when omitted, behaviour stays "match record names only" and existing callers
-    see no change.
-    """
-    must, deny = parse_query(query)
-    if not must:
-        # Neither an empty query nor an exclusion-only query (e.g. "!tmp") returns everything:
-        # both yield an empty result and are still timed. The check must depend on `must`
-        # alone — writing `not must and not deny` would miss the exclusion-only case and
-        # wrongly return the whole index.
-        return [], 0
-    t0 = time.perf_counter()
-    hits, results, scanned = [], [], 0
-    if isinstance(store, dict):
-        match_path = paths is not None and not filename_only
-        for frn, (_, name, _) in store.items():
-            scanned += 1
-            low = (paths[frn] if match_path else name).lower()
-            if all(m in low for m in must) and not any(d in low for d in deny):
-                hits.append(frn)
-                if len(hits) >= limit * 20:
-                    break
-        # In path mode the resolution table already holds the paths, so no path_of walk needed.
-        results = [(paths[f] if match_path else path_of(store, f, volume))
-                   for f in hits[:limit]]
-    else:
-        for p in store:
-            scanned += 1
-            if filename_only:
-                # Take the trailing file name only. Hand-sliced with rfind instead of
-                # os.path.basename: ntpath.basename goes through split() internally and
-                # measured an order of magnitude slower on million-entry queries.
-                i, j = p.rfind("\\"), p.rfind("/")
-                low = p[(i if i > j else j) + 1:].lower()
-            else:
-                low = p.lower()
-            if all(m in low for m in must) and not any(d in low for d in deny):
-                results.append(p)
-                if len(results) >= limit:
-                    break
-    return results, (time.perf_counter() - t0) * 1000
-
+# ---------------------------------------------------------------- CLI
 
 def main():
     argv = sys.argv[1:]
